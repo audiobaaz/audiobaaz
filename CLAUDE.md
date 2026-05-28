@@ -197,7 +197,7 @@ These are final. Do not suggest alternatives.
 | Person 1 | Claude Code | Seller flow + dashboard | COMPLETE — all V1 features done, see docs/context/seller-flow.md |
 | Person 2 | Kiro | Buyer flow + listing page | NOT STARTED |
 | Person 3 | - | Admin panel | NOT STARTED |
-| Person 4 | - | Payments + shipping | NOT STARTED |
+| Person 4 | Claude Code | Payments + shipping | IN PROGRESS — payment + shipping APIs done, see docs/context/payments-shipping.md |
 
 > Update this table when features change status.
 
