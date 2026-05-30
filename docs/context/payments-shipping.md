@@ -991,45 +991,68 @@ network call.
 
 ### Next milestone — marketplace lifecycle validation (no Razorpay dependency)
 
-Build a dev/staging-only synthetic payment path that exercises the
-full lifecycle without real Razorpay. The goal is to prove that
-buyer flow + checkout + RPCs + state transitions + timeline + audit
-all behave correctly under realistic scenarios.
+Validation proceeds in three steps, in order. The reframe (vs. the
+earlier "build a `/api/dev/payments/simulate` route" plan) is: lift
+the abstraction up to the same shape as `ShippingProvider`, so the
+routes don't need to know which payment backend is active.
 
-Surface (dev-only; gated on `process.env.NODE_ENV !== 'production'`
-and an explicit feature flag, e.g. `ENABLE_DEV_PAYMENT_SIMULATION`):
+**Step 1. Verify CheckoutForm against the credential-less state.**
+Before any abstraction work, observe what the form actually does on
+`dev.audiobaaz.com` today when `RAZORPAY_KEY_ID` /
+`RAZORPAY_KEY_SECRET` are absent:
 
+- Does `/api/payments/create` return a clear error, or a 500 with
+  no useful body?
+- Does CheckoutForm surface a helpful message, or strand the buyer
+  on a silent spinner?
+- Does an `orders` row get created at `payment_pending` and stay
+  there?
+- Does `checkout_locks` acquire a row that then leaks past TTL?
+- Does the form recover, or does the buyer have to refresh?
+
+Document findings. They shape what the abstraction must absorb.
+
+**Step 2. Introduce a `PaymentProvider` abstraction.** Same shape as
+`ShippingProvider`:
+
+```ts
+// src/lib/payments/provider.ts
+export interface PaymentProvider {
+  createOrder(input: CreateOrderInput): Promise<CreateOrderResult>;
+  verifyPayment(input: VerifyPaymentInput): Promise<VerifyPaymentResult>;
+}
 ```
-CheckoutForm
-   ↓ POST /api/payments/create        (real route — creates order_pending + payment_created + acquires checkout_lock)
-   ↓ "Simulate payment" dev-only button (replaces Razorpay modal in dev)
-   ↓ POST /api/dev/payments/simulate  (NEW — dev-only; constructs a synthetic
-                                       captured-payment payload, computes a
-                                       verification signature using the dev
-                                       webhook secret, then calls the real
-                                       /api/payments/verify path)
-   ↓ POST /api/payments/verify        (real route — calls finalize_winning_payment)
-   ↓ /orders/purchase/<order_id>      (real redirect)
-```
 
-Hard rules:
+Two implementations:
 
-- The dev simulator MUST go through the real `/api/payments/verify`
-  route. It does not bypass signature verification — it constructs
-  a payload and signs it with the same secret that route already
-  uses. The point is to exercise *every* line of the real path
-  except the outbound HTTP call to Razorpay.
-- The dev simulator MUST NOT exist in production builds. Two
-  layers: build-time check on `NODE_ENV` and a runtime
-  feature-flag check on `process.env.ENABLE_DEV_PAYMENT_SIMULATION`.
-- The dev simulator does NOT touch `webhook_events` or replay
-  semantics — those need a separate dev hook for webhook
-  simulation (a `POST /api/dev/payments/webhook-replay` that
-  re-signs and re-posts a captured/failed webhook payload to the
-  real `/api/payments/webhook`). Both are needed to validate the
-  full stack.
+- `RazorpayPaymentProvider` — refactor of the existing
+  `src/lib/razorpay/{client,helpers}.ts`. Route handlers
+  (`/api/payments/{create,verify}`) call the provider, not the
+  Razorpay client directly. No behaviour change versus PR #3.
+- `DevPaymentProvider` — selected when `PAYMENT_PROVIDER=dev`
+  AND `NODE_ENV !== 'production'`. `createOrder` returns
+  `{ razorpay_order_id: 'dev_order_<uuid>', ... }` synchronously.
+  `verifyPayment` returns a `{ payment_id, signature }` pair signed
+  with the dev key secret so the existing signature-verification
+  helper accepts it without modification. Tiny — not a Razorpay
+  clone.
 
-Scenarios to validate against the synthetic path:
+Provider selection is a small factory:
+`getPaymentProvider()` reads `process.env.PAYMENT_PROVIDER` and
+returns the right instance. **Routes never branch on `NODE_ENV`.**
+Verify-path signature verification is unchanged — it just verifies
+against whichever secret matches the active provider.
+
+**Step 3. Webhook simulation.** Webhooks are inbound, so the
+provider abstraction doesn't fit cleanly. A small dev-only endpoint
+`POST /api/dev/payments/webhook-replay` re-signs and re-posts a
+captured/failed/refund payload to the **real**
+`/api/payments/webhook`, gated by `NODE_ENV !== 'production'` AND
+`ENABLE_DEV_PAYMENT_SIMULATION === 'true'`. This validates
+idempotency, replay handling, and `webhook_events` semantics
+without Razorpay.
+
+### Lifecycle validation matrix (run with `PAYMENT_PROVIDER=dev`)
 
 | # | Scenario | Expected DB outcome |
 |---|----------|---------------------|
@@ -1092,24 +1115,29 @@ order timeline + mock shipping flow are complete:
 
 ### Order of operations (current)
 
-1. Merge PR #4 (CheckoutForm wiring) into `dev`.
-2. Update context files again after merge to reflect the new `dev` tip.
-3. Build dev-only synthetic payment path (`/api/dev/payments/simulate`
-   + `/api/dev/payments/webhook-replay`), gated behind
-   `NODE_ENV !== 'production'` AND
-   `ENABLE_DEV_PAYMENT_SIMULATION=true`.
-4. Run lifecycle scenarios A–E end-to-end against `dev.audiobaaz.com`.
-5. Build buyer + seller order timeline UI driven by `orders.status`
-   and `order_events`.
-6. Implement `ShippingProvider` abstraction +
+1. **Merge PR #4** (CheckoutForm wiring) into `dev`.
+2. **Verify CheckoutForm against the credential-less state** —
+   document what `/api/payments/create` does today without Razorpay
+   keys, what the buyer sees, and what state gets left behind.
+3. **Update context files post-merge** to reflect the new `dev` tip.
+4. **Introduce the `PaymentProvider` abstraction** + refactor the
+   existing Razorpay code into `RazorpayPaymentProvider` + add
+   `DevPaymentProvider`. Add `POST /api/dev/payments/webhook-replay`
+   for inbound-webhook simulation.
+5. **Run lifecycle scenarios A–E** with `PAYMENT_PROVIDER=dev` on
+   `dev.audiobaaz.com`.
+6. **Build buyer + seller order timeline UI** driven by
+   `orders.status` and `order_events`. Without a timeline, debugging
+   means digging through Supabase tables.
+7. **Implement `ShippingProvider` abstraction** +
    `MockShippingProvider`.
-7. Build seller shipment flow on top of the mock provider.
-8. Build admin operations (release payout, refund, resolve dispute)
-   on top of the now-validated lifecycle.
-9. (Whenever Razorpay credentials land) — swap the dev simulator
-   for the real Razorpay modal; re-run scenarios A–E against real
-   test-mode transactions.
-10. (Whenever Shiprocket credentials land) — swap
+8. **Build seller shipment flow** on top of the mock provider.
+9. **Build admin operations** (release payout, refund, resolve
+   dispute) on top of the now-validated lifecycle.
+10. (Whenever Razorpay credentials land) — set
+    `PAYMENT_PROVIDER=razorpay`; re-run scenarios A–E against real
+    test-mode transactions.
+11. (Whenever Shiprocket credentials land) — swap
     `MockShippingProvider` for `ShiprocketProvider`; no caller
     code changes.
 
