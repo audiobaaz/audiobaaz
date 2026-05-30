@@ -989,82 +989,104 @@ RPCs, same database transitions, same audit rows; the only thing
 the synthetic path skips is the external `https://api.razorpay.com`
 network call.
 
-### Next milestone — marketplace lifecycle validation (no Razorpay dependency)
+### Next milestone — Checkout failure investigation (observe before architect)
 
-Validation proceeds in three steps, in order. The reframe (vs. the
-earlier "build a `/api/dev/payments/simulate` route" plan) is: lift
-the abstraction up to the same shape as `ShippingProvider`, so the
-routes don't need to know which payment backend is active.
+Before any abstraction, simulator, or refactor work, **observe
+what the existing CheckoutForm does today on `dev.audiobaaz.com`
+when Razorpay credentials are absent**. Nobody on the project
+actually knows the answer. The possibilities branch into very
+different engineering problems:
 
-**Step 1. Verify CheckoutForm against the credential-less state.**
-Before any abstraction work, observe what the form actually does on
-`dev.audiobaaz.com` today when `RAZORPAY_KEY_ID` /
-`RAZORPAY_KEY_SECRET` are absent:
+- `/api/payments/create` fails fast with a clean 500 + a useful body
+- A `payment_pending` order row gets created *before* the Razorpay
+  call fails, leaving an orphan
+- A `checkout_locks` row gets acquired and never released
+- The UI hangs on a silent spinner
+- The UI shows an unhelpful error
+- The route crashes (uncaught exception) on missing env var
 
-- Does `/api/payments/create` return a clear error, or a 500 with
-  no useful body?
-- Does CheckoutForm surface a helpful message, or strand the buyer
-  on a silent spinner?
-- Does an `orders` row get created at `payment_pending` and stay
-  there?
-- Does `checkout_locks` acquire a row that then leaks past TTL?
-- Does the form recover, or does the buyer have to refresh?
+Each needs a different fix. Building a `PaymentProvider` abstraction
+or `DevPaymentProvider` before knowing which one matches reality is
+premature.
 
-Document findings. They shape what the abstraction must absorb.
+**Branch off `dev` after PR #4 merges:**
+`feature/payment-validation`. Goal: observe, document, decide.
+No code changes. Run a real buyer journey and capture:
 
-**Step 2. Introduce a `PaymentProvider` abstraction.** Same shape as
-`ShippingProvider`:
+| Surface | What to record |
+|---------|----------------|
+| API response | `/api/payments/create` status code, body, headers |
+| Browser console | Errors, warnings, unhandled rejections |
+| Network tab | Whether `checkout.js` even loads |
+| CheckoutForm UI | Exactly what the buyer sees |
+| `orders` table | Did a `payment_pending` row appear, with what id, does it stay |
+| `payments` table | Did a `created` row appear, tied to the order |
+| `checkout_locks` table | Was a lock acquired, when does it expire, does re-attempt 409 |
+| `order_events` table | Any rows, any silent upstream failures |
+| Server logs | Vercel logs for the failed request, full stack trace |
 
-```ts
-// src/lib/payments/provider.ts
-export interface PaymentProvider {
-  createOrder(input: CreateOrderInput): Promise<CreateOrderResult>;
-  verifyPayment(input: VerifyPaymentInput): Promise<VerifyPaymentResult>;
-}
-```
+Deliverable:
+`docs/reviews/checkout-failure-investigation.md` — short report
+naming exactly which failure branch matches reality.
 
-Two implementations:
+### Decision tree (gated on the report)
 
-- `RazorpayPaymentProvider` — refactor of the existing
-  `src/lib/razorpay/{client,helpers}.ts`. Route handlers
-  (`/api/payments/{create,verify}`) call the provider, not the
-  Razorpay client directly. No behaviour change versus PR #3.
-- `DevPaymentProvider` — selected when `PAYMENT_PROVIDER=dev`
-  AND `NODE_ENV !== 'production'`. `createOrder` returns
-  `{ razorpay_order_id: 'dev_order_<uuid>', ... }` synchronously.
-  `verifyPayment` returns a `{ payment_id, signature }` pair signed
-  with the dev key secret so the existing signature-verification
-  helper accepts it without modification. Tiny — not a Razorpay
-  clone.
+The next engineering task is determined by the report, not chosen
+ahead of it.
 
-Provider selection is a small factory:
-`getPaymentProvider()` reads `process.env.PAYMENT_PROVIDER` and
-returns the right instance. **Routes never branch on `NODE_ENV`.**
-Verify-path signature verification is unchanged — it just verifies
-against whichever secret matches the active provider.
+**Outcome A — Failure is clean and contained.** The simplest
+possible path is enough: a single `ENABLE_DEV_PAYMENT_SIMULATION=true`
+short-circuit inside `src/lib/razorpay/client.ts` that returns
+synthetic `createOrder` and `verifyPayment` results when the flag
+is set and `NODE_ENV !== 'production'`. **No `PaymentProvider`
+interface, no factory, no refactor of merged code.**
 
-**Step 3. Webhook simulation.** Webhooks are inbound, so the
-provider abstraction doesn't fit cleanly. A small dev-only endpoint
-`POST /api/dev/payments/webhook-replay` re-signs and re-posts a
-captured/failed/refund payload to the **real**
-`/api/payments/webhook`, gated by `NODE_ENV !== 'production'` AND
-`ENABLE_DEV_PAYMENT_SIMULATION === 'true'`. This validates
-idempotency, replay handling, and `webhook_events` semantics
-without Razorpay.
+**Outcome B — Failure leaves DB state behind.** Fix the routes
+first: rollback partial inserts on failure, release the checkout
+lock on error exit, emit `order_events` on failure paths. Then add
+the env-flag short-circuit per Outcome A.
 
-### Lifecycle validation matrix (run with `PAYMENT_PROVIDER=dev`)
+**Outcome C — Failure is severe (route crashes).** Simulation buys
+nothing if it can't get past the same crash point. Pivot:
+prioritise acquiring real Razorpay test credentials sooner;
+continue unrelated work (order timeline UI, `ShippingProvider`
+abstraction, mock shipping) in the meantime.
+
+The `PaymentProvider` interface that earlier drafts of this section
+proposed is **explicitly deferred**. There is one provider in the
+codebase today (Razorpay), and the only reason for a second is
+missing credentials. An env-flag short-circuit inside the existing
+implementation is more honest than a multi-provider abstraction
+designed in advance of a second provider's existence.
+
+### What is NOT being decided yet
+
+- Whether `PaymentProvider` is the right abstraction. Reconsider
+  only if the codebase grows a genuine second provider in V2.
+- Whether `/api/dev/payments/webhook-replay` is needed. Webhook
+  replay matters but only after the create + verify path is
+  observably correct.
+- The shape of the lifecycle test harness. The scenarios below are
+  the *target*; the *mechanism* depends on Outcome A / B / C.
+
+### Lifecycle validation matrix (target — mechanism TBD post-investigation)
+
+These are the runtime assertions the marketplace must prove,
+regardless of which simulation/abstraction path comes out of the
+investigation.
 
 | # | Scenario | Expected DB outcome |
 |---|----------|---------------------|
 | A | Single buyer, single listing, complete checkout | `listings.status='sold'`, `listings.sold_order_id` set; `orders.status='escrow_held'`; `payments.status='captured'`; one `order_events` row |
 | B | Buyer abandons checkout (closes tab between create + verify) | `orders.status='payment_pending'`; `checkout_locks` row exists, expires after TTL; listing remains `approved` (Decision 6) |
 | C | Two buyers race for same listing — call `/create` from two concurrent sessions, then `/verify` for both | Exactly one winner reaches `escrow_held`; the loser's `payments.refund_status='processing'`; loser's `orders.status='cancelled'`; one `order_events` row per transition; zero ownership corruption |
-| D | Webhook replay — same `payment.captured` payload submitted twice via `/api/dev/payments/webhook-replay` | First call processes; second returns `{replay: true}`; `webhook_events` shows exactly one row with `status='processed'` |
+| D | Webhook replay — same `payment.captured` payload submitted twice | First call processes; second returns `{replay: true}`; `webhook_events` shows exactly one row with `status='processed'` |
 | E | Payment failure path — synthesise a `payment.failed` event | `orders.status='payment_failed'` (recoverable); listing untouched; buyer can re-enter `/buy/checkout/[listingId]` and retry |
 
 Scenario C is the most important runtime test in the platform. Phase 1
-proved it in pure SQL at concurrency=100; this re-proves it across
-the full HTTP/route/RPC/DB stack the buyer actually traverses.
+proved it in pure SQL at concurrency=100; the runtime path re-proves
+it across the full HTTP/route/RPC/DB stack the buyer actually
+traverses.
 
 ### Then — order timeline UI
 
@@ -1116,27 +1138,29 @@ order timeline + mock shipping flow are complete:
 ### Order of operations (current)
 
 1. **Merge PR #4** (CheckoutForm wiring) into `dev`.
-2. **Verify CheckoutForm against the credential-less state** —
-   document what `/api/payments/create` does today without Razorpay
-   keys, what the buyer sees, and what state gets left behind.
+2. **Checkout failure investigation** on `feature/payment-validation`
+   (target ~1h). Observe what the existing flow does without Razorpay
+   credentials; produce
+   `docs/reviews/checkout-failure-investigation.md`.
 3. **Update context files post-merge** to reflect the new `dev` tip.
-4. **Introduce the `PaymentProvider` abstraction** + refactor the
-   existing Razorpay code into `RazorpayPaymentProvider` + add
-   `DevPaymentProvider`. Add `POST /api/dev/payments/webhook-replay`
-   for inbound-webhook simulation.
-5. **Run lifecycle scenarios A–E** with `PAYMENT_PROVIDER=dev` on
-   `dev.audiobaaz.com`.
+4. **Decide based on the report** which of Outcomes A / B / C
+   applies. The default working assumption is Outcome A (env-flag
+   short-circuit inside the existing Razorpay client), but the
+   report governs.
+5. **Run lifecycle scenarios A–E** against whichever
+   simulation/credential setup came out of Step 4.
 6. **Build buyer + seller order timeline UI** driven by
    `orders.status` and `order_events`. Without a timeline, debugging
    means digging through Supabase tables.
 7. **Implement `ShippingProvider` abstraction** +
-   `MockShippingProvider`.
+   `MockShippingProvider`. (The shipping abstraction case is stronger
+   than the payment case — two known providers, both in V1 plan.)
 8. **Build seller shipment flow** on top of the mock provider.
 9. **Build admin operations** (release payout, refund, resolve
    dispute) on top of the now-validated lifecycle.
-10. (Whenever Razorpay credentials land) — set
-    `PAYMENT_PROVIDER=razorpay`; re-run scenarios A–E against real
-    test-mode transactions.
+10. (Whenever Razorpay credentials land) — set the Razorpay env vars
+    on Vercel, unset `ENABLE_DEV_PAYMENT_SIMULATION`, re-run
+    scenarios A–E against real test-mode transactions.
 11. (Whenever Shiprocket credentials land) — swap
     `MockShippingProvider` for `ShiprocketProvider`; no caller
     code changes.
