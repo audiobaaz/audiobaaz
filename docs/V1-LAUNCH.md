@@ -45,17 +45,23 @@ Everything that does not directly move that flow forward is not V1.
   - `/api/checkout/mock` removed (file and directory)
   - Local `next build` GREEN; awaiting review/merge
 
-### BLOCKED — until merge + real-world validation
+### BLOCKED — until merge + lifecycle validation
 
-- **Real Razorpay test transaction never executed.** The architecture is
-  verified at the database layer (Phase 1 acceptance + stress) and the
-  application layer (build-green, RPC contracts honoured), but no real
-  Razorpay test capture has flowed through the system end-to-end.
-- **Webhook delivery semantics not exercised.** Razorpay's webhook URL
-  needs to be configured in the dashboard pointing at
-  `https://dev.audiobaaz.com/api/payments/webhook`.
-- **Razorpay env vars not yet on Vercel** for `dev` and `production`:
-  `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`.
+- **No real Razorpay test transaction has been executed end-to-end.**
+  Razorpay test/production credentials are not currently available
+  to the project. The architecture is verified at the database
+  layer (Phase 1 acceptance + stress at concurrency=100) and at the
+  application layer (build-green, RPC contracts honoured), but no
+  capture has flowed through `https://api.razorpay.com`.
+- **This is no longer a launch blocker.** The next milestone is
+  *marketplace lifecycle validation* using a dev-only synthetic
+  payment path that exercises every line of the real route except
+  the outbound HTTP call to Razorpay (see "NEXT ENGINEERING TASK"
+  below). Real Razorpay validation becomes a swap-in once credentials
+  are available.
+- **Razorpay env vars** (`RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`,
+  `RAZORPAY_WEBHOOK_SECRET`) are not yet on Vercel for `dev` or
+  `production`. They land when credentials do; no blocker today.
 
 ---
 
@@ -79,26 +85,79 @@ reference.
 
 ---
 
-## NEXT ENGINEERING TASK — Razorpay validation (NOT shipping)
+## NEXT ENGINEERING TASK — Marketplace lifecycle validation (no Razorpay dependency)
 
-Before any meaningful shipping work begins, run a real Razorpay
-test-mode transaction on `dev.audiobaaz.com` and validate every
-integration point:
+Real Razorpay credentials are not in our control today. The project
+should not block on them. The next milestone is to validate the
+**entire application stack** — buyer flow, checkout, RPCs, state
+transitions, audit trail, timeline — using a dev/staging-only
+synthetic payment path that exercises every line of the real route
+except the outbound `https://api.razorpay.com` HTTP call.
+
+### Synthetic payment path (to be built, dev-only)
+
+```
+CheckoutForm
+   ↓ POST /api/payments/create        (real route — order_pending + payment_created + checkout_lock)
+   ↓ "Simulate payment" dev-only button (replaces Razorpay modal in dev)
+   ↓ POST /api/dev/payments/simulate  (NEW — dev-only; constructs a synthetic
+                                       captured-payment payload, signs it with
+                                       the dev verification secret, and posts
+                                       to the real /api/payments/verify)
+   ↓ POST /api/payments/verify        (real route — calls finalize_winning_payment)
+   ↓ /orders/purchase/<order_id>      (real redirect)
+
+(parallel)
+   ↓ POST /api/dev/payments/webhook-replay  (NEW — dev-only; re-signs and re-posts
+                                             a captured/failed/refund webhook to
+                                             the real /api/payments/webhook)
+```
+
+Hard rules:
+
+- The dev simulator goes through the **real** `/api/payments/verify`
+  and `/api/payments/webhook` routes. Signature verification is not
+  bypassed — the dev route signs the synthetic payload with the same
+  secret the real handler uses.
+- Two-layer guard against shipping in production: build-time
+  `process.env.NODE_ENV !== 'production'` AND runtime feature-flag
+  `process.env.ENABLE_DEV_PAYMENT_SIMULATION === 'true'`. Either
+  failing returns 404.
+- The simulator validates application-stack correctness; it does not
+  prove Razorpay-side correctness. When credentials land, scenarios
+  A–E re-run against real test-mode transactions as a final gate.
+
+### Lifecycle validation matrix (synthetic-payment path)
+
+| # | Scenario | Expected DB outcome |
+|---|----------|---------------------|
+| **A** | Single buyer, single listing, complete checkout | `listings.status='sold'`, `listings.sold_order_id` set; `orders.status='escrow_held'`; `payments.status='captured'`; one `order_events` row |
+| **B** | Buyer abandons checkout (closes tab between create and verify) | `orders.status='payment_pending'`; `checkout_locks` row exists, expires after TTL; listing remains `approved` (Decision 6) |
+| **C** | Two buyers race for same listing — concurrent `/create` calls, then `/verify` for both | Exactly one winner reaches `escrow_held`; loser's `payments.refund_status='processing'`; loser's `orders.status='cancelled'`; one `order_events` row per transition; zero ownership corruption |
+| **D** | Webhook replay — same `payment.captured` payload re-posted via `/api/dev/payments/webhook-replay` | First call processes; second returns `{replay: true}`; `webhook_events` shows exactly one row with `status='processed'` |
+| **E** | Payment failure path — synthesise a `payment.failed` event | `orders.status='payment_failed'` (recoverable); listing untouched; buyer can re-enter `/buy/checkout/[listingId]` and retry |
+
+Scenario C is the most important runtime test in the platform. Phase
+1 proved it in pure SQL at concurrency=100 (CI green); the synthetic
+path re-proves it across the full HTTP/route/RPC/DB stack the buyer
+actually traverses.
+
+### Future — real Razorpay validation (when credentials land)
+
+Once Razorpay test/production credentials are available, swap the
+dev-simulator button for the real Razorpay modal and re-run scenarios
+A–E against real test-mode transactions. Same database assertions,
+same audit assertions; the only thing that changes is the source of
+the captured-payment event.
 
 | Check | Expected behaviour |
 |-------|-------------------|
-| **Payment creation** | Form submit → `POST /api/payments/create` returns `{ razorpay_order_id, razorpay_key_id, amount, currency, order_id }`. Order row exists at `payment_pending`. Payment row exists at `created`. checkout_lock acquired. |
-| **Razorpay modal opens** | `window.Razorpay` loads via `next/script`. Modal opens with the returned key + order_id. Buyer can complete a test card payment (4111 1111 1111 1111). |
-| **Verify route** | `POST /api/payments/verify` verifies signature, calls `finalize_winning_payment`, returns `{ result: 'winner' }`. Browser redirects to `/orders/purchase/<order_id>`. |
-| **Webhook route** | Razorpay's `payment.captured` webhook fires ~1–5s later. Handler verifies signature, upserts `webhook_events`, calls `finalize_winning_payment` which returns `noop` (already captured). `webhook_events.status = 'processed'`. |
-| **Escrow held transition** | `orders.status = 'escrow_held'`, `escrow_held_at` set. `listings.status = 'sold'`, `sold_order_id` set, `sold_at` set. `payments.status = 'captured'`. |
-| **Audit rows** | One `order_events` row with `event_name='payment_captured'`. Zero duplicate rows on webhook replay. |
-| **Webhook events** | One `webhook_events` row keyed on `(razorpay, payment.captured:<entity_id>)`. Replay returns `{ replay: true }`. |
-| **Race-loser refund path** | Hard to trigger deliberately in test; architecture verified at concurrency=100 in Phase 1 CI. Spot-check by running two concurrent /create calls for the same listing in dev tools. Loser's order should be `cancelled`, `payments.refund_status` should be `pending`. |
-| **Payment failure path** | Test with Razorpay's failure-simulation card. `payments.status = 'failed'`, `orders.status = 'payment_failed'`. Listing untouched (Decision 6). Buyer can retry. |
-| **Checkout-lock contention** | Two browser tabs hit `/create` for the same listing back-to-back. First wins; second returns 409 CHECKOUT_BUSY. After 5-min TTL, re-attempt succeeds. |
-
-Until those checks pass, **everything else is premature**.
+| **Payment creation** | `POST /api/payments/create` returns `{ razorpay_order_id, razorpay_key_id, amount, currency, order_id }`. Order at `payment_pending`. Payment at `created`. Lock acquired. |
+| **Razorpay modal opens** | `window.Razorpay` loads via `next/script`. Test card `4111 1111 1111 1111` completes successfully. |
+| **Verify route** | Signature verifies, `finalize_winning_payment` runs, browser redirects. |
+| **Webhook idempotency** | Razorpay's `payment.captured` lands within ~5s; handler returns `noop` (already captured). Replay returns `{replay: true}`. |
+| **Failure card** | Razorpay's failure-simulation card → `payments.status='failed'`, `orders.status='payment_failed'`, listing untouched. |
+| **Lock contention** | Two tabs hit `/create` for same listing back-to-back: first wins, second returns 409 CHECKOUT_BUSY. Re-attempt succeeds after 5-min TTL. |
 
 ---
 
@@ -111,9 +170,10 @@ post-validation work continues on a fresh branch off `dev`.
 
 ## DO NOT START YET
 
-Reason: the transaction engine has not been validated end-to-end with
-real Razorpay traffic. Until that succeeds, the following work is
-premature and risks rebuilding on an unverified foundation:
+Reason: marketplace lifecycle validation has not been completed
+end-to-end yet, even with the synthetic-payment path. Until that
+succeeds, the following work is premature and risks rebuilding on
+an unverified foundation:
 
 - **AI features** — recommendations, dispute analysis, fraud detection, anything ML-driven
 - **Merchant gamification** — V2 distributed verifier scope; not V1
@@ -124,6 +184,8 @@ premature and risks rebuilding on an unverified foundation:
 - **Escrow staking concepts** — anything that holds seller capital before a sale
 - **Advanced dispute automation** — auto-resolve based on evidence patterns, ML-graded outcomes
 - **Payout automation** — Razorpay Route / Razorpay Payouts API. V1 is manual UPI by admin
+- **Real Razorpay integration work** — gated on credential availability, not on engineering capacity. The synthetic-payment path covers everything except the outbound HTTP call until credentials land.
+- **Real Shiprocket integration work** — gated on credential availability. The `ShippingProvider` abstraction with `MockShippingProvider` covers all surrounding work.
 
 If a stakeholder asks for one of these before V1 launches, the answer
 is "after launch, not before." Launch first; optimise after data.
@@ -136,109 +198,110 @@ is "after launch, not before." Launch first; optimise after data.
 
 CheckoutForm + mock removal. Awaiting review.
 
-### Step 2 — Configure Razorpay credentials
+### Step 2 — Update context files post-merge
 
-Vercel (`dev` + `production` envs):
+Re-sync `CLAUDE.md`, `docs/V1-LAUNCH.md`, and the four `docs/context/*`
+files to reflect the new `dev` tip after PR #4 lands. Same pattern as
+the post-PR-#3 sync.
+
+### Step 3 — Build the dev-only synthetic payment path
+
+`POST /api/dev/payments/simulate` and
+`POST /api/dev/payments/webhook-replay`, both gated behind
+`NODE_ENV !== 'production'` AND
+`ENABLE_DEV_PAYMENT_SIMULATION === 'true'`. Both must POST through
+the **real** verify and webhook routes, signing payloads with the
+same secrets the real handlers use. This is the most surgical change
+on the path to validation; do not let scope creep into "let's also
+mock the modal UX."
+
+### Step 4 — Run lifecycle scenarios A–E
+
+Per the matrix in "NEXT ENGINEERING TASK". Document outcomes in a
+short report on the branch that adds the simulator. Scenario C is
+the most important runtime assertion; if it does not produce exactly
+one winner and exactly one initiated refund, that is the next bug.
+
+### Step 5 — Build buyer + seller order timeline UI
+
+Driven by `orders.status` + `order_events`. Needs no Razorpay and no
+Shiprocket — both data sources are populated by Step 4.
+
+```
+Order Created → Payment Captured → Escrow Held → Seller Shipped
+   → Delivered → Inspection Window → Escrow Released
+```
+
+The order detail pages (`/orders/purchase/[orderId]` for buyers,
+seller dashboard order detail for sellers) already render some of
+this; verify post-Razorpay states render correctly and add any
+missing copy.
+
+### Step 6 — Build the `ShippingProvider` abstraction + `MockShippingProvider`
+
+Lack of Shiprocket credentials is **not** blocking development.
+Build:
+
+```ts
+// src/lib/shipping/provider.ts
+export interface ShippingProvider {
+  createShipment(input: CreateShipmentInput): Promise<ShipmentRecord>;
+  getTracking(awb: string): Promise<TrackingSnapshot>;
+}
+```
+
+- `MockShippingProvider` returns synthesised AWBs (`TEST123456`,
+  courier=`Manual`, status=`created`) and advances tracking states
+  via a dev-only endpoint.
+- All caller code uses the interface, never a concrete provider.
+- `ShiprocketProvider` is added later as a provider swap once
+  credentials land. No caller-side code changes when it does.
+
+### Step 7 — Build seller shipment flow on top of the mock provider
+
+Seller dashboard order detail gains a "Create shipment" button that
+calls the shipping provider. Updates `orders.status` to
+`seller_confirmed → shipped`. Stores `tracking_number`,
+`courier_name`, `shiprocket_order_id`, `shiprocket_shipment_id`
+(populated from the mock until Shiprocket lands). Telegrams the
+buyer with tracking info.
+
+### Step 8 — Build admin operations on the validated lifecycle
+
+- Wire admin dispute resolution to call `initiate_refund(...)` on
+  buyer-favourable verdicts (`full_refund` / `partial_refund`).
+- Admin payouts page: real UPI reference text input at trigger time.
+  Route writes `payout_reference`, `payout_at`,
+  `payout_status='paid'`. Telegram the seller.
+
+### Step 9 — Real Razorpay validation (when credentials arrive)
+
+Configure on Vercel (`dev` + `production`):
 - `RAZORPAY_KEY_ID`
 - `RAZORPAY_KEY_SECRET`
 - `RAZORPAY_WEBHOOK_SECRET`
 
 Razorpay dashboard:
-- Webhook URL → `https://dev.audiobaaz.com/api/payments/webhook` (and eventually production)
-- Webhook events enabled: `payment.captured`, `payment.failed`, `refund.processed`, `refund.failed`
+- Webhook URL → `https://dev.audiobaaz.com/api/payments/webhook` (then production)
+- Events: `payment.captured`, `payment.failed`, `refund.processed`, `refund.failed`
 
-### Step 3 — Run real Razorpay test purchase
+Re-run scenarios A–E (now the "Future — real Razorpay validation"
+matrix in the previous section) against real test-mode transactions.
+Same DB assertions, same audit assertions.
 
-Per the validation matrix in "NEXT ENGINEERING TASK" above. Document
-results. If anything fails, that's the next bug to fix.
+### Step 10 — Real Shiprocket integration (when credentials arrive)
 
-### Step 4 — Validate `escrow_held` lifecycle
+Build `ShiprocketProvider` as the concrete implementation behind the
+existing interface. No changes to the seller shipment flow, the
+order timeline, the buyer tracking page, or notifications. The
+audit's §5.9 keep-list (`src/lib/shiprocket/{client,helpers}.ts`)
+becomes the body of `ShiprocketProvider`.
 
-After a successful test capture, walk the order through the full
-lifecycle:
-- `escrow_held → seller_confirmed` (when seller acts)
-- `→ shipped → delivered` (manual today; Shiprocket-driven later)
-- `→ inspection` (auto via `set_inspection_window` trigger on `delivered`)
-- `→ completed` (manual via dev advance-order tooling, or after inspection window)
+### Step 11 — Closed beta
 
-### Step 5 — Validate webhook replay path
-
-Trigger replay manually (Razorpay dashboard supports re-firing events):
-- Re-fire a `payment.captured` event for a captured payment
-- Confirm `webhook_events` returns `replay: true`
-- Confirm zero new `order_events` rows
-- Confirm `payments` / `orders` / `listings` byte-for-byte unchanged
-
-### Step 6 — Validate payment failure path
-
-Use Razorpay's test card for failures.
-- `payments.status = 'failed'`
-- `orders.status = 'payment_failed'`
-- Buyer can retry (form re-submit)
-
-### Step 7 — Validate concurrent-buyer race path
-
-Either (a) two browser tabs hitting `/create` near-simultaneously, or
-(b) write a Node script that hits `/create` twice in parallel for the
-same listing. Confirm:
-- Exactly one buyer reaches `escrow_held`
-- Other buyer's order is `cancelled`
-- `payments.refund_status = 'pending'` for the loser
-- Buyer-facing message reads "another buyer completed payment first"
-
-### Step 8 — Build order timeline UI
-
-Order detail page already exists (`/orders/purchase/[orderId]`). Verify
-it correctly renders the post-Razorpay states. Add any missing copy.
-
-### Step 9 — Build shipping abstraction
-
-**Important:** lack of Shiprocket credentials is NOT currently blocking
-development. Use a provider abstraction so shipping work can proceed
-with a mock implementation while real Shiprocket credentials are
-acquired separately.
-
-```
-ShippingProvider
-  createShipment(order: Order): Promise<ShipmentResult>
-  getTracking(awb: string): Promise<TrackingResult>
-
-implementations:
-  MockShippingProvider     — synthetic AWBs, fake tracking, no external calls
-  ShiprocketProvider       — real Shiprocket integration; swap in when ready
-```
-
-The mock implementation must allow:
-- Seller shipment flow (UI works end-to-end)
-- Order timeline updates (`seller_confirmed → shipped`)
-- Shipment lifecycle visibility (admin panel, buyer order page)
-- Telegram notifications (using fake AWB codes)
-
-Shiprocket later becomes a **provider swap**, not an architecture
-rewrite. The audit's §5.9 keep-list (`src/lib/shiprocket/{client,helpers}.ts`)
-becomes the body of `ShiprocketProvider` when those credentials land.
-
-### Step 10 — Build seller shipment flow
-
-Seller dashboard order detail gains a "Create shipment" button that
-calls the shipping provider. Updates `orders.status` to
-`seller_confirmed` then `shipped`. Stores `tracking_number`,
-`courier_name`, `shiprocket_order_id`, `shiprocket_shipment_id`.
-Telegrams the buyer with tracking info.
-
-### Step 11 — Build admin operations
-
-- Wire admin dispute resolution to call `initiate_refund(...)` on
-  buyer-favourable verdicts (`full_refund` / `partial_refund`).
-- Admin payouts page gains a real UPI reference text input at trigger
-  time. Route writes `payout_reference`, `payout_at`,
-  `payout_status='paid'`. Telegram the seller.
-
-### Step 12 — Closed beta
-
-Once Steps 1–11 are validated end-to-end, run a small invite-only
-beta with 5–10 real listings + 5–10 real buyers. Watch the audit
-tables. Fix anything that surfaces. Then open V1 launch.
+Once Steps 1–10 have shipped, run a small invite-only beta with
+5–10 real listings + 5–10 real buyers. Watch the audit tables. Fix
+anything that surfaces. Then open V1 launch.
 
 ---
 

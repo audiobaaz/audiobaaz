@@ -956,183 +956,171 @@ against, not what they can call today.
 
 ## Next Session Starts Here
 
-OQ#1 was resolved on 2026-05-30 with the locked V1 contract above.
-The remaining critical Open Questions before Phase 1 can start are
-**OQ#4** (one-paid-offer invariant) and **OQ#5** (atomic RPC). Both
-became safety-critical specifically *because* of Decision 6: the
-listing stays available until capture, so race correctness lives
-entirely in the DB invariant + atomic transaction, not in
-application-layer reservations.
+**Status reset (2026-05-30):** OQ#1, OQ#4, OQ#5, OQ#6, OQ#7 are all
+resolved. Phase 1 schema substrate (PR #2) and Phase 2 Razorpay
+routes (PR #3) are merged to `dev`. PR #4 (CheckoutForm wiring;
+`/api/checkout/mock` removed) is open. The architecture phase is
+complete; the project is now in **validation**.
 
-### Phase 1 priority order (recorded 2026-05-30; re-prioritised 2026-05-30)
+The pre-merge planning content that previously lived in this section
+(Phase 1 priority order, Phase 1 PR scope, Phase 2 cleanup table,
+acceptance gates, sequencing rules) was the build-up to those merges
+and is preserved upstream:
 
-Driving principle: **split-brain state is the one thing the system
-cannot tolerate.** Atomicity precedes invariant precedes refund flow
-precedes lock optimisation.
+- Phase 1 priority order, PR scope, and acceptance gates →
+  `supabase/tests/phase1_scenarios.sql`,
+  `supabase/tests/phase1_stress.sh`,
+  `.github/workflows/phase1-verification.yml`,
+  `docs/reviews/payments-session-zero.md` §4.
+- The Phase 2 four-row "rogue UPDATE listings" cleanup table →
+  resolved by the PR #2 invariant guards (migration 005 +
+  migration 006); the parked routes were rewritten as thin RPC
+  wrappers in PR #3 before merging.
+- Sequencing rules → all six steps executed; only step 6 (real
+  Razorpay validation) remains, and is gated below.
 
-1. **OQ#5 — Atomic `finalize_winning_payment(...)` RPC.** Highest
-   priority. If the RPC is wrong, the marketplace produces split-brain
-   state: listing sold but offer not updated, or offer won but listing
-   not sold. Person 1 should demonstrate **Scenario B** (mid-cascade
-   crash → all-or-nothing) before any lock-table or refund-optimisation
-   work begins. Scenario B is the hardest gate; if it passes, the
-   other three become straightforward.
-2. **OQ#4 — Lifetime invariant.** Second priority. Mechanism locked
-   (`listings.sold_offer_id UUID UNIQUE NULL`); the work is wiring
-   the constraint and proving Scenarios A, C, D pass.
-3. **OQ#7 — Refund flow + refund lifecycle.** Third priority.
-   Synchronous refund call inside the webhook handler under the locked
-   V1 contract; gated on the new `payments.refund_status` column
-   landing first (Hard Prerequisite #9). Without first-class refund
-   state, "did we refund this person?" is unanswerable from the
-   database.
-4. **OQ#6 — `checkout_locks` table.** Fourth priority. Optimisation,
-   not correctness. The system runs correctly without it if priorities
-   1–3 are correct; lock failure just generates more loser refunds.
+### Real Razorpay credentials are not currently available
 
-### Phase 1 schema PR scope
+Razorpay test/production keys are not in our control today. The
+project should not block waiting for them. The next milestone is
+**marketplace lifecycle validation**, executed against the *whole
+application stack* using a dev-only synthetic payment path — same
+RPCs, same database transitions, same audit rows; the only thing
+the synthetic path skips is the external `https://api.razorpay.com`
+network call.
 
-Person 1 produces a single PR covering:
+### Next milestone — marketplace lifecycle validation (no Razorpay dependency)
 
-- `orders.status` enum amendment to the locked V1 lifecycle.
-- `offers.status` enum: add `lost`.
-- `listings.sold_offer_id UUID UNIQUE NULL REFERENCES offers(id)` —
-  OQ#4 mechanism locked. Set once inside the atomic RPC at
-  `escrow_held`. Never unset, never updated.
-- `finalize_winning_payment(...)` RPC.
-- `webhook_events`, `offer_events`, `order_events`, `checkout_locks`
-  tables.
-- `payments.refund_status`, `refund_id`, `refund_reason`,
-  `refund_initiated_at`, `refund_completed_at`, `refund_failure_reason`
-  columns. New refund-lifecycle enum.
-- Invariant guard triggers (migration 005): `sold_offer_id`
-  immutability + `listings.status` no-regression. Catches any
-  rogue write to listings ownership regardless of which client
-  issued it. The invariant is only as strong as the weakest
-  update path.
-- RLS policies on the audit tables.
-- Drop `reserve_listing` trigger.
+Build a dev/staging-only synthetic payment path that exercises the
+full lifecycle without real Razorpay. The goal is to prove that
+buyer flow + checkout + RPCs + state transitions + timeline + audit
+all behave correctly under realistic scenarios.
 
-### Phase 2 application-side cleanup (must precede Razorpay route revisions)
+Surface (dev-only; gated on `process.env.NODE_ENV !== 'production'`
+and an explicit feature flag, e.g. `ENABLE_DEV_PAYMENT_SIMULATION`):
 
-A grep audit on `feature/payments-shipping` (recorded 2026-05-30)
-found four code paths that bypass `finalize_winning_payment` and
-would now trigger the migration 005 invariant guards. None of these
-paths exist on `dev`, but they exist on the parked branch and must
-be replaced before the Razorpay routes go live:
+```
+CheckoutForm
+   ↓ POST /api/payments/create        (real route — creates order_pending + payment_created + acquires checkout_lock)
+   ↓ "Simulate payment" dev-only button (replaces Razorpay modal in dev)
+   ↓ POST /api/dev/payments/simulate  (NEW — dev-only; constructs a synthetic
+                                       captured-payment payload, computes a
+                                       verification signature using the dev
+                                       webhook secret, then calls the real
+                                       /api/payments/verify path)
+   ↓ POST /api/payments/verify        (real route — calls finalize_winning_payment)
+   ↓ /orders/purchase/<order_id>      (real redirect)
+```
 
-| File | Issue | Phase 2 fix |
-|------|-------|-------------|
-| `src/app/api/payments/webhook/route.ts:88` | `UPDATE listings SET status='sold'` without `sold_offer_id` | Replace with `rpc('finalize_winning_payment', ...)` |
-| `src/app/api/payments/webhook/route.ts:138` | On `payment.failed`: `UPDATE listings SET status='approved', reserved_at=NULL` (the resurrection path) | Remove entirely. Decision 6 dropped the reservation flow; failed payments leave the listing alone |
-| `src/app/api/payments/verify/route.ts:99` | Same as webhook line 88 | Replace with the RPC |
-| `src/app/api/checkout/mock/route.ts:97` | Mock checkout writes `status='sold'` without `sold_offer_id` | Delete the route; `CheckoutForm` points at `/api/payments/create` |
+Hard rules:
 
-Phase 2 cannot ship until these four paths are removed or replaced.
-Migration 005 is the safety net — it ensures any code that tries to
-write the old way fails loudly with a `check_violation` rather than
-silently corrupting ownership.
+- The dev simulator MUST go through the real `/api/payments/verify`
+  route. It does not bypass signature verification — it constructs
+  a payload and signs it with the same secret that route already
+  uses. The point is to exercise *every* line of the real path
+  except the outbound HTTP call to Razorpay.
+- The dev simulator MUST NOT exist in production builds. Two
+  layers: build-time check on `NODE_ENV` and a runtime
+  feature-flag check on `process.env.ENABLE_DEV_PAYMENT_SIMULATION`.
+- The dev simulator does NOT touch `webhook_events` or replay
+  semantics — those need a separate dev hook for webhook
+  simulation (a `POST /api/dev/payments/webhook-replay` that
+  re-signs and re-posts a captured/failed webhook payload to the
+  real `/api/payments/webhook`). Both are needed to validate the
+  full stack.
 
-### Phase 1 acceptance criteria — five scenarios + stress harness
+Scenarios to validate against the synthetic path:
 
-Before any application code is written against the new schema, the
-Phase 1 PR must demonstrate the following at the database layer
-(Postgres-level test, not application-level mock). These are the
-failure modes that destroy escrow marketplaces; if the schema can
-survive all of them, the marketplace core is largely de-risked.
+| # | Scenario | Expected DB outcome |
+|---|----------|---------------------|
+| A | Single buyer, single listing, complete checkout | `listings.status='sold'`, `listings.sold_order_id` set; `orders.status='escrow_held'`; `payments.status='captured'`; one `order_events` row |
+| B | Buyer abandons checkout (closes tab between create + verify) | `orders.status='payment_pending'`; `checkout_locks` row exists, expires after TTL; listing remains `approved` (Decision 6) |
+| C | Two buyers race for same listing — call `/create` from two concurrent sessions, then `/verify` for both | Exactly one winner reaches `escrow_held`; the loser's `payments.refund_status='processing'`; loser's `orders.status='cancelled'`; one `order_events` row per transition; zero ownership corruption |
+| D | Webhook replay — same `payment.captured` payload submitted twice via `/api/dev/payments/webhook-replay` | First call processes; second returns `{replay: true}`; `webhook_events` shows exactly one row with `status='processed'` |
+| E | Payment failure path — synthesise a `payment.failed` event | `orders.status='payment_failed'` (recoverable); listing untouched; buyer can re-enter `/buy/checkout/[listingId]` and retry |
 
-**Must pass (acceptance gate, no merge to `dev` without all three):**
+Scenario C is the most important runtime test in the platform. Phase 1
+proved it in pure SQL at concurrency=100; this re-proves it across
+the full HTTP/route/RPC/DB stack the buyer actually traverses.
 
-1. **All five SQL scenarios** in `supabase/tests/phase1_scenarios.sql`
-   pass:
-   - **A — Concurrent captures:** two simultaneous captures →
-     exactly one winner, the other refunded.
-   - **B — Mid-cascade crash:** RPC interrupted halfway →
-     everything committed or nothing committed; never half-state.
-     **Gate-of-gates.** If this fails, fix before continuing —
-     atomicity bugs cannot be papered over with retries.
-   - **C — Refunded winner immutability:** dispute resolved in
-     buyer's favour → `listings.status` and `sold_offer_id`
-     unchanged; no second order possible for that listing.
-   - **D — High-concurrency race:** 10 sequential captures at the
-     gateway → exactly 1 marketplace winner, 9 refunded losers, 0
-     ownership corruption.
-   - **E — Webhook replay:** Razorpay retries the same
-     captured-payment webhook → first call wins; subsequent calls
-     return `noop` with byte-for-byte identical state and zero
-     duplicate audit rows. Two sub-tests: E1 (replay alone) and E2
-     (replay interleaved with a second buyer's capture).
-2. **Multi-connection stress** at concurrency = 100 via
-   `supabase/tests/phase1_stress.sh` (pgbench harness):
-   100 parallel pgbench clients each call
-   `finalize_winning_payment()` for a distinct payment on the
-   same listing. Marketplace state must be byte-perfect: exactly
-   1 winner, 99 losers, full audit trail. Single-session SQL
-   tests prove correctness against the invariant + `FOR UPDATE`
-   locks; the stress harness proves they hold under true OS-level
-   parallelism. *If you skip this, you do not actually know
-   whether the system survives concurrent captures — you have a
-   hypothesis.*
-3. **Schema Contract review (audit §4)** signed off by Person 1
-   and Person 4 as amended by the OQ#1 resolution.
+### Then — order timeline UI
 
-**Auditability assertion (applies to A, D, and E):** all losers
-must be discoverable and recoverable from the database alone. The
-audit trail must answer "which order won, which lost, when, why
-was each refunded, and what is the current refund status of each
-loser" without recourse to Razorpay dashboards or application logs.
+Once the synthetic-payment path passes A–E, build the buyer-facing
+and seller-facing order timeline:
 
-If all three gates pass, the marketplace core is considered
-de-risked and Phase 2 (Razorpay integration) can proceed.
+```
+Order Created → Payment Captured → Escrow Held → Seller Shipped
+   → Delivered → Inspection Window → Escrow Released
+```
 
-If all three gates pass, the marketplace core is considered
-de-risked and Phase 2 (Razorpay integration) can proceed.
+This needs no Razorpay and no Shiprocket. Status transitions feed
+from `orders.status` + `order_events`; both are populated by the
+synthetic-payment validation above.
 
-The full per-scenario narrative — exactly what each test sets up,
-runs, and asserts — lives in `supabase/tests/phase1_scenarios.sql`
-and `supabase/tests/README.md`. Treat those files as the source of
-truth for what "passes" means; this section names the gates, the
-test file proves them.
+### Then — shipping behind the provider abstraction
 
-### Sequencing rules
+Same direction as the "Shipping strategy" section above. Build:
 
-1. ~~Resolve OQ#1 (lifecycle).~~ **Done — see "Order state machine —
-   locked V1 contract" above.**
-2. ~~Land Phase 1 schema substrate.~~ **In code on
-   feature/payments-shipping** (commits c3ed389 / ab49e76 / e72caa4
-   plus the Scenario E + stress harness follow-up + invariant
-   guards + listing-status separation).
-   **Not yet verified** — the acceptance scenarios have not been
-   run against a live Postgres because this machine has no psql /
-   supabase CLI / docker. **Code written ≠ correctness proven.**
-   Verification runbook: `supabase/tests/RUNBOOK.md`. Automated
-   verification on every PR touching marketplace-core SQL:
-   `.github/workflows/phase1-verification.yml`.
-3. Person 1 + Person 4 sign off on the Schema Contract (audit §4)
-   as amended by the OQ#1 resolution.
-4. Merge feature/payments-shipping → dev (schema only — Phase 2
-   application work follows).
-5. Wipe synthetic `payments WHERE razorpay_order_id LIKE 'mock_%'`
-   rows before Phase 2 begins.
-6. Phase 2 (Razorpay) revises the parked routes per audit §5.9 to
-   call `finalize_winning_payment(...)`, `initiate_refund(...)`,
-   `record_refund_outcome(...)`, and `acquire_checkout_lock(...)`.
+- `src/lib/shipping/provider.ts` — `ShippingProvider` interface
+- `src/lib/shipping/mock-provider.ts` — `MockShippingProvider`
+  returning synthesised AWBs and dev-advanced tracking states
+- Seller "create shipment" UI, tracking page, courier-event
+  webhook ingress — all caller code uses the interface, never
+  the concrete provider
 
-### What needs verifying before the merge
+`ShiprocketProvider` is added later as a provider swap once
+credentials are available. No caller code changes when it lands.
 
-- **Run the four-scenario acceptance test.** Per
-  `supabase/tests/README.md`. Scenario B is the gate; if it fails,
-  fix before continuing.
-- **Application-side cleanup.** The parked Razorpay routes
-  (`src/app/api/payments/{create,verify,webhook}/route.ts`)
-  reference the dropped `reserve_listing` flow and the old
-  `escrow_held`-on-capture lifecycle. Audit §5.9 already records
-  these as "Revise" — that work happens in Phase 2 once the schema
-  lands. The routes are NOT live on dev (no `payments/` directory
-  exists there), so this is a Phase 2 todo, not a runtime regression.
-- **Multi-connection concurrency check.** The four scenarios prove
-  correctness in a single session against the lifetime invariant +
-  `SELECT ... FOR UPDATE` locks. A pgbench-style multi-connection
-  stress test (e.g. 20 concurrent calls to `finalize_winning_payment`
-  for the same listing) belongs in CI and should land before Phase 2
-  begins.
+### What is explicitly deferred
+
+Do **not** start any of the following until lifecycle validation +
+order timeline + mock shipping flow are complete:
+
+- AI features
+- Merchant gamification
+- Reputation systems
+- Recommendation engines
+- Dynamic pricing
+- Seller leaderboards
+- Escrow staking concepts
+- Advanced dispute automation
+- Payout automation (manual UPI transfer + reference ID is V1)
+- Real Razorpay validation — gated on credential access; do not
+  block other progress on it
+- Real Shiprocket integration — gated on credential access; the
+  provider abstraction lets all surrounding work continue
+
+### Order of operations (current)
+
+1. Merge PR #4 (CheckoutForm wiring) into `dev`.
+2. Update context files again after merge to reflect the new `dev` tip.
+3. Build dev-only synthetic payment path (`/api/dev/payments/simulate`
+   + `/api/dev/payments/webhook-replay`), gated behind
+   `NODE_ENV !== 'production'` AND
+   `ENABLE_DEV_PAYMENT_SIMULATION=true`.
+4. Run lifecycle scenarios A–E end-to-end against `dev.audiobaaz.com`.
+5. Build buyer + seller order timeline UI driven by `orders.status`
+   and `order_events`.
+6. Implement `ShippingProvider` abstraction +
+   `MockShippingProvider`.
+7. Build seller shipment flow on top of the mock provider.
+8. Build admin operations (release payout, refund, resolve dispute)
+   on top of the now-validated lifecycle.
+9. (Whenever Razorpay credentials land) — swap the dev simulator
+   for the real Razorpay modal; re-run scenarios A–E against real
+   test-mode transactions.
+10. (Whenever Shiprocket credentials land) — swap
+    `MockShippingProvider` for `ShiprocketProvider`; no caller
+    code changes.
+
+### Historical verification status (resolved by PR #2)
+
+- ~~Run the five-scenario acceptance test.~~ Resolved — all five
+  scenarios pass in CI on every PR touching marketplace-core SQL
+  (`.github/workflows/phase1-verification.yml`).
+- ~~Multi-connection concurrency check.~~ Resolved —
+  `supabase/tests/phase1_stress.sh` passes at concurrency=100 in CI.
+- ~~Application-side cleanup.~~ Resolved by PR #3 — routes call
+  RPCs only; PR #4 deletes the last route (`/api/checkout/mock`)
+  that wrote `listings.status` directly.
+
