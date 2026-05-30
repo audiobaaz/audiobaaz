@@ -206,7 +206,7 @@ Remaining items (V1.5 / nice-to-have, not blocking launch):
 2. Populate the `products` table — product search degrades gracefully, but needs data to be useful
 3. Profile photo upload — onboarding currently uses initials avatar; Supabase Storage `avatars` bucket needed
 4. Nav order count queries all-time offers + orders; could filter to active-only in future
-5. Mock checkout (`POST /api/checkout/mock`) is a temporary bypass — replace with real Razorpay flow when Person 4's payments are ready
+5. Real Razorpay checkout is now wired (PR #4 — `feature/checkout-razorpay-wire`); the historical `/api/checkout/mock` bypass has been removed. Seller-side surfaces should not reference mock checkout.
 
 ---
 

@@ -1,8 +1,8 @@
 
 # Payments & Shipping — Context File
 **Owner:** Person 4
-**Branch:** feature/payments-shipping (not yet created)
-**Last updated:** 2026-05-29
+**Branch:** feature/checkout-razorpay-wire (PR #4 open; PR #2 + PR #3 merged to `dev`)
+**Last updated:** 2026-05-30
 
 ---
 
@@ -25,65 +25,118 @@ edge that fires from a verified Razorpay capture.
 
 ```
 [ ] Not started
-[x] In progress — Phase 1 schema substrate written on
-    feature/payments-shipping (commits c3ed389 RPC + invariant +
-    audit tables, ab49e76 refund-lifecycle, e72caa4 checkout_locks);
-    pending verification against a live Postgres (four-scenario
-    test in supabase/tests/phase1_scenarios.sql) and PR back to
-    dev. OQ#1 RESOLVED 2026-05-30 — see "Order state machine —
-    locked V1 contract" below; session-zero audit complete
-    (docs/reviews/payments-session-zero.md is the authoritative
-    artifact; Schema Contract §4 is the primary review surface).
-[ ] Complete
+[x] PARTIALLY MERGED — Phase 1 schema substrate (PR #2,
+    merge commit 230d9ae) and Phase 2 payment routes (PR #3,
+    merge commit 7b294e9) are on `dev`. PR #4 (CheckoutForm
+    wired to Razorpay; /api/checkout/mock removed) is OPEN
+    against `dev` from feature/checkout-razorpay-wire — build
+    green, awaiting review/merge. OQ#1 RESOLVED 2026-05-30
+    (order state machine locked); OQ#4 RESOLVED 2026-05-30
+    (ownership anchor moved from sold_offer_id to sold_order_id
+    in migration 006); OQ#7 RESOLVED 2026-05-30 (refund
+    lifecycle landed in migration 003). Session-zero audit
+    complete (docs/reviews/payments-session-zero.md is the
+    authoritative historical artifact).
+[ ] Complete (blocked on real Razorpay end-to-end validation —
+    no real test transaction has been executed yet)
 [ ] Blocked
 ```
 
-### Phase 1 schema FROZEN as of 2026-05-30
+### Phase 1 + Phase 2 delivery (post-merge state)
 
-> **No new migrations, triggers, RPCs, state machines, or test
-> scenarios on this branch until a verification run actually fails
-> and points at a real bug.**
+The substrate and route layer are both on `dev`. Migrations 002–006
+landed via PR #2; the Razorpay routes landed via PR #3 as thin
+wrappers that call only the locked RPCs (zero direct
+`UPDATE listings` / `UPDATE offers` / `UPDATE orders` from route
+code). PR #4 wires the `/buy/checkout/[listingId]` page's
+CheckoutForm to those routes.
 
-The Phase 1 surface is complete:
+Merged Phase 1 surface (on `dev`):
 
-- atomic RPC (`finalize_winning_payment`)
-- lifetime invariant column + UNIQUE constraint
-- refund lifecycle (state machine + two RPCs)
-- audit tables (`offer_events`, `order_events`, `webhook_events`)
-- invariant-guard triggers (`sold_offer_id` immutable, `listings.status`
-  terminal-at-`sold`)
-- `checkout_locks` table + acquire/release RPCs
-- five acceptance scenarios + multi-connection stress harness
-- CI workflow + runbook + Supabase compatibility bootstrap
+- atomic RPC (`finalize_winning_payment`) — migration 002
+- lifetime invariant column + UNIQUE constraint —
+  `listings.sold_order_id` is the canonical anchor (migration 006);
+  `listings.sold_offer_id` retained as informational metadata only
+- refund lifecycle (state machine + `initiate_refund` /
+  `record_refund_outcome` RPCs) — migration 003
+- audit tables (`offer_events`, `order_events`, `webhook_events`) —
+  migration 002
+- invariant-guard triggers (`sold_offer_id` immutable,
+  `sold_order_id` immutable, `listings.status` terminal-at-`sold`) —
+  migration 005 + migration 006
+- `checkout_locks` table + `acquire_checkout_lock` /
+  `release_checkout_lock` RPCs — migration 004
+- five acceptance scenarios (A through E2) + multi-connection
+  stress harness at concurrency=100, all green in CI
+- CI verification workflow
+  (`.github/workflows/phase1-verification.yml`) +
+  Supabase compatibility bootstrap
 
-This is enough architecture for a V1 marketplace core. Every
-additional migration written without an executed test run is
-optimisation of an unexercised system. The freeze is in place so
-the team focuses on **running the gate**, not extending it.
+Merged Phase 2 surface (on `dev`):
 
-Exception: a verification failure that points at a real bug
-(missing column, wrong constraint shape, broken RPC logic) is the
-one trigger to amend a migration. All other "while we're here"
-changes wait until after Phase 1 PR merges to `dev`.
+- `POST /api/payments/create` — acquires checkout lock, creates
+  Razorpay order, inserts `payment_pending` order + `created`
+  payment row
+- `POST /api/payments/verify` — verifies callback signature,
+  calls `finalize_winning_payment`; on conflict calls
+  `initiate_refund` for the race loser
+- `POST /api/payments/webhook` — verifies webhook signature,
+  upserts into `webhook_events` for idempotency, dispatches
+  `payment.captured` / `payment.failed` / `refund.processed` /
+  `refund.failed` to the appropriate RPCs
+- `src/lib/razorpay/client.ts` — lazy singleton (throws on first
+  use, not at module load — keeps `next build` green when
+  credentials aren't present in the build environment)
+- `src/lib/razorpay/helpers.ts` — timing-safe HMAC verification
+  for both webhook and verify-callback signatures
 
-After Phase 1 verification passes and merges, the **next focus is
-Phase 2 application work** — wiring the existing RPCs into the
-Razorpay routes per the audit's §5.9 disposition. Not more
-migrations.
+Open work (PR #4 — `feature/checkout-razorpay-wire`):
 
-Status reality (audit-verified):
-- No payment or shipping code on `dev`. `src/app/api/` has no
-  `payments/` or `shipping/` directories.
-- Nine Razorpay/Shiprocket files exist on the parked
-  `feature/payments-shipping` branch (HEAD `f47ab10`); audit §5.9
-  ("Implementation Inventory") records the file-by-file disposition
-  (5 keep, 4 revise, 0 rewrite).
-- Buyer flow on `dev` uses `/api/checkout/mock` as a transitional
-  stand-in. Replaced in Phase 2 (audit §8).
+- CheckoutForm rewritten to call `POST /api/payments/create`,
+  open the Razorpay modal with the returned `order_id`, then
+  call `POST /api/payments/verify` on `handler` and redirect to
+  `/orders/purchase/<order_id>`
+- `next/script` lazy-loads `checkout.js`; `window.Razorpay` is
+  typed via a module declaration
+- Branches handled: modal dismiss, network error, conflict
+  (race loser — refund initiated), webhook fallback (verify
+  call lost but webhook lands)
+- `/api/checkout/mock` removed (file + parent directories)
+- `next build` green locally
 
-Offer-domain code on `dev` remains mock-backed (`src/lib/offers/*` +
-`src/lib/mock/offers.ts`). Nothing on `dev` talks to Razorpay or
-Shiprocket.
+### Next milestone — real Razorpay validation
+
+The architecture is verified at the database layer (Phase 1
+acceptance + stress) and the application layer (build green, RPC
+contracts honoured), but **no real test-mode Razorpay transaction
+has been executed end-to-end yet**. That is the highest-risk
+unknown remaining in the system.
+
+Validation matrix (run after PR #4 merges and Razorpay test
+credentials are configured):
+
+| # | What to validate | Where to observe it |
+|---|------------------|---------------------|
+| 1 | `POST /api/payments/create` returns a usable `order_id` and the modal opens | Browser network tab + Razorpay dashboard |
+| 2 | A successful test capture lands on `escrow_held` | `orders.status` row + `order_events` row |
+| 3 | Signature verification accepts the gateway-signed callback | `/api/payments/verify` response 200 |
+| 4 | Webhook handler is idempotent on replay | `webhook_events` shows one row per event id |
+| 5 | A failed capture transitions `payment_pending → payment_failed` (recoverable) | `orders.status` + `order_events` |
+| 6 | Two near-simultaneous captures: one wins (`escrow_held`), the other gets `initiate_refund` called automatically | `payments.refund_status = 'processing'` for the loser |
+| 7 | `record_refund_outcome` lands `refund_status = 'succeeded'` after the gateway confirms | `payments.refund_completed_at` set |
+| 8 | Checkout lock prevents two `payments/create` calls for the same listing in the same TTL window | `checkout_locks` row + 409 response on the second call |
+
+Until that matrix is green against real test transactions, no
+shipping work begins. The shipping path is lower risk than the
+payment path; running it before payments validate would be
+optimising the wrong end of the funnel.
+
+Lack of Shiprocket credentials is **not** currently a development
+blocker. Shipping should be built behind a `ShippingProvider`
+abstraction (`createShipment()`, `getTracking()`) with a
+`MockShippingProvider` implementation first; `ShiprocketProvider`
+becomes a provider swap once credentials land. See "Shipping
+strategy" below.
 
 ---
 
@@ -566,31 +619,76 @@ implementation plan blocks on a cross-team handoff that wasn't planned.
 
 ---
 
-## Files This Feature Will Own (planned)
+## Files This Feature Will Own (status — post PR #2 + PR #3 merge)
 
-Nothing on this list exists on `dev`. Nine of them exist on the parked
-`feature/payments-shipping` branch (`f47ab10`). The audit at
-`docs/reviews/payments-session-zero.md` §2 Inventory C and §5.9
-Implementation Inventory record the file-by-file disposition that
-Phase 2 will follow. Listed below for shared expectations only.
+PR #2 (schema) and PR #3 (Razorpay routes) shipped the substrate
+and the route wrappers. Five files now exist on `dev`; CheckoutForm
+wiring (PR #4) is the only outstanding application-layer change for
+the payments path. Shipping files remain unwritten — see
+"Shipping strategy" below for the provider-abstraction direction.
 
 ```
-src/lib/razorpay/client.ts                       — singleton instance, throws on missing keys
-src/lib/razorpay/helpers.ts                      — signature verification (webhook + callback)
-src/lib/razorpay/checkout-lock.ts                — Layer 1 pre-payment guard
-src/lib/razorpay/refund.ts                       — race-loser refund job
-src/lib/shiprocket/client.ts                     — token-cached fetch wrapper
-src/lib/shiprocket/helpers.ts                    — payload builders, type definitions
-src/lib/orders/state.ts                          — order state machine (mirrors src/lib/offers/state.ts shape)
-src/lib/orders/types.ts                          — order view-models
-src/app/api/payments/create/route.ts             — issues Razorpay order_id under checkout lock
-src/app/api/payments/verify/route.ts             — client-callback verification
-src/app/api/payments/webhook/route.ts            — Razorpay server-to-server webhook
-src/app/api/shipping/create-shipment/route.ts    — seller-initiated shipment creation
-src/app/api/shipping/track/route.ts              — read-side tracking
-src/app/api/shipping/webhook/route.ts            — Shiprocket courier-event webhook
-src/app/api/orders/[id]/route.ts                 — order read + admin actions (release, refund)
+✅ src/lib/razorpay/client.ts                       — lazy singleton (PR #3)
+✅ src/lib/razorpay/helpers.ts                      — signature verification (PR #3)
+✅ src/app/api/payments/create/route.ts             — issues Razorpay order_id under checkout lock (PR #3)
+✅ src/app/api/payments/verify/route.ts             — client-callback verification + finalize_winning_payment dispatch (PR #3)
+✅ src/app/api/payments/webhook/route.ts            — Razorpay webhook → captured/failed/refund.* RPC dispatch (PR #3)
+
+🟡 src/components/checkout/CheckoutForm.tsx         — wired in PR #4 (open). Calls /api/payments/create → modal → /api/payments/verify → redirect
+   src/app/(main)/buy/checkout/[listingId]/page.tsx  — server-rendered page hosting CheckoutForm (already on dev)
+
+❌ src/lib/shipping/provider.ts                     — ShippingProvider interface (createShipment, getTracking) — NOT YET WRITTEN
+❌ src/lib/shipping/mock-provider.ts                — MockShippingProvider — NOT YET WRITTEN
+❌ src/lib/shipping/shiprocket-provider.ts          — ShiprocketProvider — NOT YET WRITTEN
+❌ src/lib/orders/state.ts                          — order state machine (mirrors src/lib/offers/state.ts shape) — NOT YET WRITTEN
+❌ src/lib/orders/types.ts                          — order view-models — NOT YET WRITTEN
+❌ src/app/api/shipping/create-shipment/route.ts    — seller-initiated shipment creation
+❌ src/app/api/shipping/track/route.ts              — read-side tracking
+❌ src/app/api/shipping/webhook/route.ts            — courier-event webhook (provider-agnostic)
+❌ src/app/api/orders/[id]/route.ts                 — admin actions (release, refund, resolve_dispute)
 ```
+
+The historical `src/lib/razorpay/checkout-lock.ts` and
+`src/lib/razorpay/refund.ts` files from the parked
+`feature/payments-shipping` branch were not carried forward —
+their responsibilities collapsed into the locked Phase 1 RPCs
+(`acquire_checkout_lock`, `release_checkout_lock`,
+`initiate_refund`, `record_refund_outcome`). Routes call the
+RPCs directly; there is no application-layer lock or refund
+helper.
+
+---
+
+## Shipping strategy
+
+Shipping is **not** on the critical path until the Razorpay
+end-to-end validation is green. When shipping work begins, build
+it behind a provider abstraction so Shiprocket-specific code can
+be swapped in without rewriting the seller shipment flow, the
+order timeline, or the courier-event webhook.
+
+```ts
+// src/lib/shipping/provider.ts
+export interface ShippingProvider {
+  createShipment(input: CreateShipmentInput): Promise<ShipmentRecord>;
+  getTracking(awb: string): Promise<TrackingSnapshot>;
+}
+```
+
+Two implementations:
+
+- `MockShippingProvider` — synthesizes AWBs, advances tracking
+  state on a dev-only endpoint, lets us build and test the
+  seller shipment flow + order timeline + buyer notifications
+  without Shiprocket credentials.
+- `ShiprocketProvider` — real implementation. Slots in once
+  credentials land; no caller code changes.
+
+This is why "no Shiprocket credentials" is **not** a launch
+blocker. The credential-sensitive surface is small (one provider
+file); everything else — the seller's "create shipment" UI, the
+order timeline, the webhook ingress, the buyer-facing tracking
+page — runs against the mock provider until credentials arrive.
 
 ---
 
@@ -602,25 +700,25 @@ src/app/api/orders/[id]/route.ts                 — order read + admin actions 
 | `offer_events` | INSERT | One row per transition |
 | `orders` | INSERT, UPDATE | Insert at handoff; UPDATE through order lifecycle |
 | `order_events` | INSERT | One row per order transition |
-| `listings` | UPDATE | `sold_offer_id` set transactionally; status → `sold` |
+| `listings` | UPDATE | `sold_order_id` set transactionally inside `finalize_winning_payment` (canonical ownership anchor — migration 006); status → `sold`. `sold_offer_id` populated only when offer-backed (informational). |
 | `payments` | INSERT, UPDATE | Razorpay record + capture/refund state |
 | `webhook_events` | INSERT, UPDATE | Idempotency table; record once per provider event id |
 | `users` | SELECT | Telegram chat ids for notifications, UPI for payouts |
 
 ---
 
-## API Routes Owned (planned)
+## API Routes Owned (status)
 
-| Method | Route | What it does |
-|--------|-------|--------------|
-| POST | `/api/payments/create` | Acquire checkout lock, create Razorpay order, return modal params |
-| POST | `/api/payments/verify` | Verify client callback signature; idempotent with webhook |
-| POST | `/api/payments/webhook` | Razorpay server-to-server; runs winner cascade transaction |
-| POST | `/api/shipping/create-shipment` | Seller creates Shiprocket shipment for `escrow_held` order |
-| GET  | `/api/shipping/track` | Read-side AWB lookup; buyer + seller |
-| POST | `/api/shipping/webhook` | Shiprocket courier events → order state transitions |
-| GET  | `/api/orders/[id]` | Order detail (RLS-scoped to participants + admin) |
-| PATCH| `/api/orders/[id]` | Admin actions: release_payout, refund, resolve_dispute |
+| Method | Route | What it does | Status |
+|--------|-------|--------------|--------|
+| POST | `/api/payments/create` | Acquire checkout lock, create Razorpay order, return modal params | ✅ on `dev` (PR #3) |
+| POST | `/api/payments/verify` | Verify client callback signature; calls `finalize_winning_payment`; on conflict calls `initiate_refund` | ✅ on `dev` (PR #3) |
+| POST | `/api/payments/webhook` | Razorpay server-to-server; idempotent via `webhook_events`; dispatches captured/failed/refund.* to RPCs | ✅ on `dev` (PR #3) |
+| POST | `/api/shipping/create-shipment` | Seller creates shipment for `escrow_held` order (provider-abstraction) | ❌ not started |
+| GET  | `/api/shipping/track` | Read-side AWB lookup; buyer + seller | ❌ not started |
+| POST | `/api/shipping/webhook` | Courier events → order state transitions (provider-agnostic ingress) | ❌ not started |
+| GET  | `/api/orders/[id]` | Order detail (RLS-scoped to participants + admin) | ❌ not started |
+| PATCH| `/api/orders/[id]` | Admin actions: release_payout, refund, resolve_dispute | ❌ not started |
 
 ---
 

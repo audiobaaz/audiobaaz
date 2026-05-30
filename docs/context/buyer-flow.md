@@ -1,8 +1,8 @@
 # Buyer Flow — Context File
 **Owner:** Person 2
 **Tool:** Kiro
-**Branch:** feature/buyer-flow
-**Last updated:** 2026-05-29
+**Branch:** feature/buyer-flow (merged); active payment-wiring branch is feature/checkout-razorpay-wire (PR #4 open)
+**Last updated:** 2026-05-30
 
 ---
 
@@ -29,15 +29,15 @@ single listing page, checkout, order dashboard, watchlist, saved searches.
 [x] Buyer-flow files: tsc clean, lint clean, dev smoke-tested
 [ ] Real offers persistence — replace mock createOfferDraft / getMyOffers / getOfferDetail with Supabase
 [ ] Buyer-side offer cancel — RLS policy + API route (coordinate with Person 1 first)
-[ ] Real Pay now flow — checkout / Razorpay (Person 4 dependency)
+[ ] Real Pay now flow — checkout / Razorpay (Person 4 dependency — Phase 2 routes merged via PR #3; CheckoutForm wired in PR #4, currently open)
 [x] Nav updated (Person 1) — profile avatar dropdown; My Orders counts both offers + orders tables; links to /orders/purchases
-[x] Mock checkout flow (Person 1) — /buy/checkout/[listingId] collects delivery address (pre-filled from profile); POST /api/checkout/mock skips Razorpay, creates order (escrow_held) + mock payment, marks listing sold, Telegrams seller
+[x] Razorpay checkout flow — /buy/checkout/[listingId] collects delivery address (pre-filled from profile); CheckoutForm calls POST /api/payments/create → opens Razorpay modal → POST /api/payments/verify on success → redirects to /orders/purchase/[orderId]. /api/checkout/mock removed. Wiring lives on feature/checkout-razorpay-wire (PR #4 open)
 [x] /orders/purchases — lists all buy-now orders with status + links to order detail
 [x] /orders/purchase/[orderId] — full order detail page: status timeline, delivery address, price breakdown, dev advance-order button, dispute form during inspection window
 [x] POST /api/disputes — buyer raises dispute; validates inspection window, creates dispute record, marks order disputed
 [x] POST /api/dev/advance-order — dev-only; pushes order to inspection (delivered_at + inspection_expires_at = now+48h)
 [ ] Watchlist, saved searches, disputes, orders dashboard, ratings — defer
-[x] /buy/checkout/[listingId] (mock) + /orders/purchase/[orderId] (post-purchase) — live; real Razorpay swap deferred to Person 4's Phase 2 (see docs/reviews/payments-session-zero.md §8)
+[x] /buy/checkout/[listingId] (Razorpay-wired; PR #4 open) + /orders/purchase/[orderId] (post-purchase) — live; CheckoutForm calls /api/payments/create + /api/payments/verify per Person 4's Phase 2 routes (see docs/context/payments-shipping.md and docs/V1-LAUNCH.md). Real test-mode validation pending after PR #4 merges.
 ```
 
 ---
@@ -53,7 +53,7 @@ single listing page, checkout, order dashboard, watchlist, saved searches.
 | `/orders` | Redirect to `/orders/offers` | protected | `src/app/orders/page.tsx` |
 | `/orders/offers` | Buyer offer dashboard (3 sections) | protected | `src/app/orders/offers/page.tsx` |
 | `/orders/offers/[id]` | Offer detail | protected | `src/app/orders/offers/[id]/page.tsx` |
-| `/buy/checkout/[listingId]` | Mock checkout — collects delivery address, calls `/api/checkout/mock` | protected | `src/app/buy/checkout/[listingId]/page.tsx` |
+| `/buy/checkout/[listingId]` | Checkout — collects delivery address, calls `/api/payments/create` to open Razorpay modal, then `/api/payments/verify` on success | protected | `src/app/buy/checkout/[listingId]/page.tsx` |
 | `/orders/purchases` | Buyer purchases list (buy-now orders) | protected | `src/app/orders/purchases/page.tsx` |
 | `/orders/purchase/[orderId]` | Order detail — status timeline, address, dispute form during inspection window, dev advance-order button | protected | `src/app/orders/purchase/[orderId]/page.tsx` |
 
@@ -431,8 +431,8 @@ component owns rendering.
 | users | SELECT | Seller profile on listing page |
 
 Today the buyer surface is split: discovery (browse, listing detail, homepage
-featured strip) and purchase (mock checkout, orders list, order detail,
-disputes) run on real Supabase. Offers persistence is still mock-backed
+featured strip) and purchase (Razorpay checkout via PR #4, orders list, order
+detail, disputes) run on real Supabase. Offers persistence is still mock-backed
 (`src/lib/offers/*`). The next persistence slice replaces those mock
 bodies inside `src/lib/offers/*` without touching pages or components.
 
