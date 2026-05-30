@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mv CLAUDE.md /tmp/ab_claude_md)",
+      "Bash(mv .env.example /tmp/ab_env_example)",
+      "Bash(npx create-next-app@14 . --typescript --tailwind --eslint --app --src-dir --import-alias \"@/*\" --use-npm)",
+      "Bash(mv /Users/bhavit/Desktop/audiobaaz/.claude /tmp/ab_claude_dir && npx create-next-app@14 . --typescript --tailwind --eslint --app --src-dir --import-alias \"@/*\" --use-npm 2>&1)"
+    ]
+  }
+}
