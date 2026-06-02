@@ -3,7 +3,7 @@
 > Read this file at the start of EVERY session before writing any code.
 > After reading, summarize what you understand before proceeding.
 
----
+--- 
 
 ## What This Project Is
 
