@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Audiobaaz · under way</title>
+<meta name="description" content="Audiobaaz, the market for audio obsessives, is under way. Every listing condition-graded, every transaction escrow-protected.">
+<meta name="theme-color" content="#FFFFFF">
+<link rel="icon" href="/favicon.ico">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600;800&family=JetBrains+Mono:wght@500;700&display=swap">
+<style>
+:root{--bg:#FFFFFF;--surface-2:#F5F5F5;--border:#E8E8E8;--text:#0A0A0A;--text-2:#666666;--text-3:#999999;--accent:#E8FF4D}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text)}
+body{font-family:Inter,"DM Sans",system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased;display:flex;flex-direction:column;height:100svh}
+.mono{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace}
+.top{display:flex;align-items:center;justify-content:space-between;padding:clamp(16px,3vh,28px) clamp(20px,5vw,64px)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:20px;letter-spacing:-.03em;color:var(--text);text-decoration:none}
+.brand svg{width:30px;height:30px}
+.status{display:flex;align-items:center;gap:10px;font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--text-2)}
+.status i{width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 2px var(--text);animation:blink 1.8s ease-in-out infinite}
+main{flex:1;min-height:0;display:grid;grid-template-columns:1.15fr .85fr;align-items:center;gap:clamp(24px,5vw,80px);padding:0 clamp(20px,5vw,64px)}
+h1{font-family:"Instrument Serif",Georgia,serif;font-weight:400;font-size:clamp(46px,7.4vw,112px);line-height:.94;letter-spacing:-.025em}
+h1 em{font-style:italic;background:linear-gradient(transparent 60%,var(--accent) 60%);padding:0 .06em}
+.lead{margin-top:clamp(14px,2.6vh,28px);max-width:36ch;font-size:clamp(16px,1.4vw,19px);line-height:1.55;color:var(--text-2)}
+.chips{margin-top:clamp(16px,3vh,32px);display:flex;flex-wrap:wrap;gap:8px}
+.chips span{font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;border:1px solid var(--border);background:var(--surface-2);border-radius:999px;padding:8px 13px}
+.cta{display:inline-flex;align-items:center;gap:10px;margin-top:clamp(18px,3vh,32px);background:var(--text);color:var(--accent);text-decoration:none;font-weight:600;font-size:16px;padding:15px 22px;border-radius:14px}
+.cta:hover{transform:translateY(-1px)}
+.wave{height:clamp(48px,11vh,110px);display:flex;align-items:flex-end;gap:clamp(2px,.35vw,4px);padding:0 clamp(20px,5vw,64px);overflow:hidden}
+.wave b{flex:1;min-width:2px;border-radius:3px 3px 0 0;background:var(--text);transform-origin:bottom;animation:eq 1.6s ease-in-out infinite alternate}
+.wave b:nth-child(7n){background:var(--accent);box-shadow:inset 0 0 0 1px var(--text)}
+footer{display:flex;justify-content:space-between;gap:16px;padding:12px clamp(20px,5vw,64px) clamp(14px,2.6vh,26px);font-size:12px;letter-spacing:.06em;color:var(--text-3)}
+@keyframes blink{50%{opacity:.35}}
+@keyframes eq{from{transform:scaleY(.15)}to{transform:scaleY(1)}}
+@keyframes float{50%{transform:translateY(-12px) rotate(-3deg)}}
+.side{position:relative;isolation:isolate;display:grid;place-items:center;height:100%;max-height:560px}
+.card{width:min(340px,46vh);background:#fff;border:1px solid var(--border);border-radius:22px;padding:12px;box-shadow:0 30px 60px -20px rgba(10,10,10,.25);animation:float 7s ease-in-out infinite;transform:rotate(-2deg)}
+.card img{display:block;width:100%;aspect-ratio:1;object-fit:cover;border-radius:14px;background:var(--surface-2)}
+.card .row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 6px 4px}
+.card .name{font-weight:600;font-size:15px;letter-spacing:-.01em}
+.card .grade{font-size:11px;letter-spacing:.08em;text-transform:uppercase;background:var(--accent);border:1px solid var(--text);border-radius:999px;padding:5px 9px;white-space:nowrap}
+.card .meta{padding:2px 6px 6px;font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-3)}
+.blob{position:absolute;width:min(420px,60vh);aspect-ratio:1;border-radius:50%;background:var(--accent);z-index:-1;transform:translate(18%,6%)}
+
+@media (max-width:860px){main{grid-template-columns:1fr}.side{display:none}}
+@media (max-height:600px){.chips,.lead{display:none}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important}}
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/" aria-label="Audiobaaz">
+    <svg viewBox="0 0 30 30" aria-hidden="true"><rect width="30" height="30" rx="8" fill="#0A0A0A"/><rect x="7" y="12" width="3.2" height="9" rx="1.6" fill="#E8FF4D"/><rect x="13.4" y="7" width="3.2" height="16" rx="1.6" fill="#E8FF4D"/><rect x="19.8" y="10" width="3.2" height="12" rx="1.6" fill="#E8FF4D"/></svg>
+    audiobaaz
+  </a>
+  <div class="status mono"><i aria-hidden="true"></i>Under way</div>
+</header>
+<main>
+  <section>
+    <h1>The market for <em>audio obsessives</em> is warming up.</h1>
+    <p class="lead">We are retuning Audiobaaz. Every listing condition-graded, every transaction escrow-protected, built for India's audio community.</p>
+    <div class="chips mono"><span>Condition-graded</span><span>Escrow-protected</span><span>Made for India</span></div>
+  </section>
+  <aside class="side" aria-hidden="true">
+    <div class="blob"></div>
+    <div class="card">
+      <img src="/prod-sennheiser-hd800s.png" alt="" width="1024" height="1024">
+      <div class="row"><span class="name">Sennheiser HD 800 S</span><span class="grade mono">Grade A</span></div>
+      <div class="meta mono">Escrow-protected · Verified seller</div>
+    </div>
+  </aside>
+</main>
+<div class="wave" aria-hidden="true" id="wave"></div>
+<footer class="mono"><span>&copy; Audiobaaz</span><span>Back soon</span></footer>
+<script>
+(function () {
+  var wave = document.getElementById("wave");
+  var count = Math.max(40, Math.min(140, Math.round(window.innerWidth / 9)));
+  for (var i = 0; i < count; i++) {
+    var b = document.createElement("b");
+    var h = 18 + Math.round(70 * Math.abs(Math.sin(i * 0.37) * Math.cos(i * 0.11)));
+    b.style.height = h + "%";
+    b.style.animationDelay = (-(i % 17) * 0.11).toFixed(2) + "s";
+    b.style.animationDuration = (1.2 + (i % 5) * 0.18).toFixed(2) + "s";
+    wave.appendChild(b);
+  }
+})();
+</script>
+</body>
+</html>

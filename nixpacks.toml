@@ -1,0 +1,17 @@
+# Dokploy build type: Nixpacks. The coming-soon page has zero npm dependencies,
+# so the install and build phases do nothing and the server starts at once.
+
+[phases.setup]
+nixPkgs = ["nodejs_20"]
+
+[phases.install]
+cmds = ["echo 'no dependencies to install'"]
+
+[phases.build]
+cmds = ["echo 'nothing to build'"]
+
+[start]
+cmd = "node server.js"
+
+[variables]
+NODE_ENV = "production"
